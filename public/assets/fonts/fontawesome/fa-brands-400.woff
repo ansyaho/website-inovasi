@@ -1,0 +1,2304 @@
+<?php
+
+declare(strict_types=1);
+
+namespace GuzzleHttp\Promise;
+
+final class Utils
+{
+    /**
+     * Get the global task queue used for promise resolution.
+     *
+     * This task queue MUST be run in an event loop in order for promises to be
+     * settled asynchronously. It will be automatically run when synchronously
+     * waiting on a promise.
+     *
+     * <code>
+     * while ($eventLoop->isRunning()) {
+     *     GuzzleHttp\Promise\Utils::queue()->run();
+     * }
+     * </code>
+     *
+     * @param TaskQueueInterface|null $assign Optionally specify a new queue instance.
+     */
+    public static function queue(TaskQueueInterface $assign = null): TaskQueueInterface
+    {
+        static $queue;
+
+        if ($assign) {
+            $queue = $assign;
+        } elseif (!$queue) {
+            $queue = new TaskQueue();
+        }
+
+        return $queue;
+    }
+
+    /**
+     * Adds a function to run in the task queue when it is next `run()` and
+     * returns a promise that is fulfilled or rejected with the result.
+     *
+     * @param callable $task Task function to run.
+     */
+    public static function task(callable $task): PromiseInterface
+    {
+        $queue = self::queue();
+        $promise = new Promise([$queue, 'run']);
+        $queue->add(function () use ($task, $promise): void {
+            try {
+                if (Is::pending($promise)) {
+                    $promise->resolve($task());
+                }
+            } catch (\Throwable $e) {
+                $promise->reject($e);
+            }
+        });
+
+        return $promise;
+    }
+
+    /**
+     * Synchronously waits on a promise to resolve and returns an inspection
+     * state array.
+     *
+     * Returns a state associative array containing a "state" key mapping to a
+     * valid promise state. If the state of the promise is "fulfilled", the
+     * array will contain a "value" key mapping to the fulfilled value of the
+     * promise. If the promise is rejected, the array will contain a "reason"
+     * key mapping to the rejection reason of the promise.
+     *
+     * @param PromiseInterface $promise Promise or value.
+     */
+    public static function inspect(PromiseInterface $promise): array
+    {
+        try {
+            return [
+                'state' => PromiseInterface::FULFILLED,
+                'value' => $promise->wait(),
+            ];
+        } catch (RejectionException $e) {
+            return ['state' => PromiseInterface::REJECTED, 'reason' => $e->getReason()];
+        } catch (\Throwable $e) {
+            return ['state' => PromiseInterface::REJECTED, 'reason' => $e];
+        }
+    }
+
+    /**
+     * Waits on all of the provided promises, but does not unwrap rejected
+     * promises as thrown exception.
+     *
+     * Returns an array of inspection state arrays.
+     *
+     * @see inspect for the inspection state array format.
+     *
+     * @param PromiseInterface[] $promises Traversable of promises to wait upon.
+     */
+    public static function inspectAll($promises): array
+    {
+        $results = [];
+        foreach ($promises as $key => $promise) {
+            $results[$key] = self::inspect($promise);
+        }
+
+        return $results;
+    }
+
+    /**
+     * Waits on all of the provided promises and returns the fulfilled values.
+     *
+     * Returns an array that contains the value of each promise (in the same
+     * order the promises were provided). An exception is thrown if any of the
+     * promises are rejected.
+     *
+     * @param iterable<PromiseInterface> $promises Iterable of PromiseInterface objects to wait on.
+     *
+     * @throws \Throwable on error
+     */
+    public static function unwrap($promises): array
+    {
+        $results = [];
+        foreach ($promises as $key => $promise) {
+            $results[$key] = $promise->wait();
+        }
+
+        return $results;
+    }
+
+    /**
+     * Given an array of promises, return a promise that is fulfilled when all
+     * the items in the array are fulfilled.
+     *
+     * The promise's fulfillment value is an array with fulfillment values at
+     * respective positions to the original array. If any promise in the array
+     * rejects, the returned promise is rejected with the rejection reason.
+     *
+     * @param mixed $promises  Promises or values.
+     * @param bool  $recursive If true, resolves new promises that might have been added to the stack during its own resolution.
+     */
+    public static function all($promises, bool $recursive = false): PromiseInterface
+    {
+        $results = [];
+        $promise = Each::of(
+            $promises,
+            function ($value, $idx) use (&$results): void {
+                $results[$idx] = $value;
+            },
+            function ($reason, $idx, Promise $aggregate): void {
+                $aggregate->reject($reason);
+            }
+        )->then(function () use (&$results) {
+            ksort($results);
+
+            return $results;
+        });
+
+        if (true === $recursive) {
+            $promise = $promise->then(function ($results) use ($recursive, &$promises) {
+                foreach ($promises as $promise) {
+                    if (Is::pending($promise)) {
+                        return self::all($promises, $recursive);
+                    }
+                }
+
+                return $results;
+            });
+        }
+
+        return $promise;
+    }
+
+    /**
+     * Initiate a competitive race between multiple promises or values (values
+     * will become immediately fulfilled promises).
+     *
+     * When count amount of promises have been fulfilled, the returned promise
+     * is fulfilled with an array that contains the fulfillment values of the
+     * winners in order of resolution.
+     *
+     * This promise is rejected with a {@see AggregateException} if the number
+     * of fulfilled promises is less than the desired $count.
+     *
+     * @param int   $count    Total number of promises.
+     * @param mixed $promises Promises or values.
+     */
+    public static function some(int $count, $promises): PromiseInterface
+    {
+        $results = [];
+        $rejections = [];
+
+        return Each::of(
+            $promises,
+            function ($value, $idx, PromiseInterface $p) use (&$results, $count): void {
+                if (Is::settled($p)) {
+                    return;
+                }
+                $results[$idx] = $value;
+                if (count($results) >= $count) {
+                    $p->resolve(null);
+                }
+            },
+            function ($reason) use (&$rejections): void {
+                $rejections[] = $reason;
+            }
+        )->then(
+            function () use (&$results, &$rejections, $count) {
+                if (count($results) !== $count) {
+                    throw new AggregateException(
+                        'Not enough promises to fulfill count',
+                        $rejections
+                    );
+                }
+                ksort($results);
+
+                return array_values($results);
+            }
+        );
+    }
+
+    /**
+     * Like some(), with 1 as count. However, if the promise fulfills, the
+     * fulfillment value is not an array of 1 but the value directly.
+     *
+     * @param mixed $promises Promises or values.
+     */
+    public static function any($promises): PromiseInterface
+    {
+        return self::some(1, $promises)->then(function ($values) {
+            return $values[0];
+        });
+    }
+
+    /**
+     * Returns a promise that is fulfilled when all of the provided promises have
+     * been fulfilled or rejected.
+     *
+     * The returned promise is fulfilled with an array of inspection state arrays.
+     *
+     * @see inspect for the inspection state array format.
+     *
+     * @param mixed $promises Promises or values.
+     */
+    public static function settle($promises): PromiseInterface
+    {
+        $results = [];
+
+        return Each::of(
+            $promises,
+            function ($value, $idx) use (&$results): void {
+                $results[$idx] = ['state' => PromiseInterface::FULFILLED, 'value' => $value];
+            },
+            function ($reason, $idx) use (&$results): void {
+                $results[$idx] = ['state' => PromiseInterface::REJECTED, 'reason' => $reason];
+            }
+        )->then(function () use (&$results) {
+            ksort($results);
+
+            return $results;
+        });
+    }
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        # Change Log
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## 2.6.2 - 2023-12-03
+
+### Fixed
+
+- Fixed another issue with the fact that PHP transforms numeric strings in array keys to ints
+
+### Changed
+
+- Updated links in docs to their canonical versions
+- Replaced `call_user_func*` with native calls
+
+## 2.6.1 - 2023-08-27
+
+### Fixed
+
+- Properly handle the fact that PHP transforms numeric strings in array keys to ints
+
+## 2.6.0 - 2023-08-03
+
+### Changed
+
+- Updated the mime type map to add some new entries, fix a couple of invalid entries, and remove an invalid entry
+- Fallback to `application/octet-stream` if we are unable to guess the content type for a multipart file upload
+
+## 2.5.1 - 2023-08-03
+
+### Fixed
+
+- Corrected mime type for `.acc` files to `audio/aac`
+
+### Changed
+
+- PHP 8.3 support
+
+## 2.5.0 - 2023-04-17
+
+### Changed
+
+- Adjusted `psr/http-message` version constraint to `^1.1 || ^2.0`
+
+## 2.4.5 - 2023-04-17
+
+### Fixed
+
+- Prevent possible warnings on unset variables in `ServerRequest::normalizeNestedFileSpec`
+- Fixed `Message::bodySummary` when `preg_match` fails
+- Fixed header validation issue
+
+## 2.4.4 - 2023-03-09
+
+### Changed
+
+- Removed the need for `AllowDynamicProperties` in `LazyOpenStream`
+
+## 2.4.3 - 2022-10-26
+
+### Changed
+
+- Replaced `sha1(uniqid())` by `bin2hex(random_bytes(20))`
+
+## 2.4.2 - 2022-10-25
+
+### Fixed
+
+- Fixed erroneous behaviour when combining host and relative path
+
+## 2.4.1 - 2022-08-28
+
+### Fixed
+
+- Rewind body before reading in `Message::bodySummary`
+
+## 2.4.0 - 2022-06-20
+
+### Added
+
+- Added provisional PHP 8.2 support
+- Added `UriComparator::isCrossOrigin` method
+
+## 2.3.0 - 2022-06-09
+
+### Fixed
+
+- Added `Header::splitList` method
+- Added `Utils::tryGetContents` method
+- Improved `Stream::getContents` method
+- Updated mimetype mappings
+
+## 2.2.2 - 2022-06-08
+
+### Fixed
+
+- Fix `Message::parseRequestUri` for numeric headers
+- Re-wrap exceptions thrown in `fread` into runtime exceptions
+- Throw an exception when multipart options is misformatted
+
+## 2.2.1 - 2022-03-20
+
+### Fixed
+
+- Correct header value validation
+
+## 2.2.0 - 2022-03-20
+
+### Added
+
+- A more compressive list of mime types
+- Add JsonSerializable to Uri
+- Missing return types
+
+### Fixed
+
+- Bug MultipartStream no `uri` metadata
+- Bug MultipartStream with filename for `data://` streams
+- Fixed new line handling in MultipartStream
+- Reduced RAM usage when copying streams
+- Updated parsing in `Header::normalize()`
+
+## 2.1.1 - 2022-03-20
+
+### Fixed
+
+- Validate header values properly
+
+## 2.1.0 - 2021-10-06
+
+### Changed
+
+- Attempting to create a `Uri` object from a malformed URI will no longer throw a generic
+  `InvalidArgumentException`, but rather a `MalformedUriException`, which inherits from the former
+  for backwards compatibility. Callers relying on the exception being thrown to detect invalid
+  URIs should catch the new exception.
+
+### Fixed
+
+- Return `null` in caching stream size if remote size is `null`
+
+## 2.0.0 - 2021-06-30
+
+Identical to the RC release.
+
+## 2.0.0@RC-1 - 2021-04-29
+
+### Fixed
+
+- Handle possibly unset `url` in `stream_get_meta_data`
+
+## 2.0.0@beta-1 - 2021-03-21
+
+### Added
+
+- PSR-17 factories
+- Made classes final
+- PHP7 type hints
+
+### Changed
+
+- When building a query string, booleans are represented as 1 and 0.
+
+### Removed
+
+- PHP < 7.2 support
+- All functions in the `GuzzleHttp\Psr7` namespace
+
+## 1.8.1 - 2021-03-21
+
+### Fixed
+
+- Issue parsing IPv6 URLs
+- Issue modifying ServerRequest lost all its attributes
+
+## 1.8.0 - 2021-03-21
+
+### Added
+
+- Locale independent URL parsing
+- Most classes got a `@final` annotation to prepare for 2.0
+
+### Fixed
+
+- Issue when creating stream from `php://input` and curl-ext is not installed
+- Broken `Utils::tryFopen()` on PHP 8
+
+## 1.7.0 - 2020-09-30
+
+### Added
+
+- Replaced functions by static methods
+
+### Fixed
+
+- Converting a non-seekable stream to a string
+- Handle multiple Set-Cookie correctly
+- Ignore array keys in header values when merging
+- Allow multibyte characters to be parsed in `Message:bodySummary()`
+
+### Changed
+
+- Restored partial HHVM 3 support
+
+
+## [1.6.1] - 2019-07-02
+
+### Fixed
+
+- Accept null and bool header values again
+
+
+## [1.6.0] - 2019-06-30
+
+### Added
+
+- Allowed version `^3.0` of `ralouphie/getallheaders` dependency (#244)
+- Added MIME type for WEBP image format (#246)
+- Added more validation of values according to PSR-7 and RFC standards, e.g. status code range (#250, #272)
+
+### Changed
+
+- Tests don't pass with HHVM 4.0, so HHVM support got dropped. Other libraries like composer have done the same. (#262)
+- Accept port number 0 to be valid (#270)
+
+### Fixed
+
+- Fixed subsequent reads from `php://input` in ServerRequest (#247)
+- Fixed readable/writable detection for certain stream modes (#248)
+- Fixed encoding of special characters in the `userInfo` component of an URI (#253)
+
+
+## [1.5.2] - 2018-12-04
+
+### Fixed
+
+- Check body size when getting the message summary
+
+
+## [1.5.1] - 2018-12-04
+
+### Fixed
+
+- Get the summary of a body only if it is readable
+
+
+## [1.5.0] - 2018-12-03
+
+### Added
+
+- Response first-line to response string exception (fixes #145)
+- A test for #129 behavior
+- `get_message_body_summary` function in order to get the message summary
+- `3gp` and `mkv` mime types
+
+### Changed
+
+- Clarify exception message when stream is detached
+
+### Deprecated
+
+- Deprecated parsing folded header lines as per RFC 7230
+
+### Fixed
+
+- Fix `AppendStream::detach` to not close streams
+- `InflateStream` preserves `isSeekable` attribute of the underlying stream
+- `ServerRequest::getUriFromGlobals` to support URLs in query parameters
+
+
+Several other fixes and improvements.
+
+
+## [1.4.2] - 2017-03-20
+
+### Fixed
+
+- Reverted BC break to `Uri::resolve` and `Uri::removeDotSegments` by removing
+  calls to `trigger_error` when deprecated methods are invoked.
+
+
+## [1.4.1] - 2017-02-27
+
+### Added
+
+- Rriggering of silenced deprecation warnings.
+
+### Fixed
+
+- Reverted BC break by reintroducing behavior to automagically fix a URI with a
+  relative path and an authority by adding a leading slash to the path. It's only
+  deprecated now.
+
+
+## [1.4.0] - 2017-02-21
+
+### Added
+
+- Added common URI utility methods based on RFC 3986 (see documentation in the readme):
+  - `Uri::isDefaultPort`
+  - `Uri::isAbsolute`
+  - `Uri::isNetworkPathReference`
+  - `Uri::isAbsolutePathReference`
+  - `Uri::isRelativePathReference`
+  - `Uri::isSameDocumentReference`
+  - `Uri::composeComponents`
+  - `UriNormalizer::normalize`
+  - `UriNormalizer::isEquivalent`
+  - `UriResolver::relativize`
+
+### Changed
+
+- Ensure `ServerRequest::getUriFromGlobals` returns a URI in absolute form.
+- Allow `parse_response` to parse a response without delimiting space and reason.
+- Ensure each URI modification results in a valid URI according to PSR-7 discussions.
+  Invalid modifications will throw an exception instead of returning a wrong URI or
+  doing some magic.
+  - `(new Uri)->withPath('foo')->withHost('example.com')` will throw an exception
+    because the path of a URI with an authority must start with a slash "/" or be empty
+  - `(new Uri())->withScheme('http')` will return `'http://localhost'`
+
+### Deprecated
+
+- `Uri::resolve` in favor of `UriResolver::resolve`
+- `Uri::removeDotSegments` in favor of `UriResolver::removeDotSegments`
+
+### Fixed
+
+- `Stream::read` when length parameter <= 0.
+- `copy_to_stream` reads bytes in chunks instead of `maxLen` into memory.
+- `ServerRequest::getUriFromGlobals` when `Host` header contains port.
+- Compatibility of URIs with `file` scheme and empty host.
+
+
+## [1.3.1] - 2016-06-25
+
+### Fixed
+
+- `Uri::__toString` for network path references, e.g. `//example.org`.
+- Missing lowercase normalization for host.
+- Handling of URI components in case they are `'0'` in a lot of places,
+  e.g. as a user info password.
+- `Uri::withAddedHeader` to correctly merge headers with different case.
+- Trimming of header values in `Uri::withAddedHeader`. Header values may
+  be surrounded by whitespace which should be ignored according to RFC 7230
+  Section 3.2.4. This does not apply to header names.
+- `Uri::withAddedHeader` with an array of header values.
+- `Uri::resolve` when base path has no slash and handling of fragment.
+- Handling of encoding in `Uri::with(out)QueryValue` so one can pass the
+  key/value both in encoded as well as decoded form to those methods. This is
+  consistent with withPath, withQuery etc.
+- `ServerRequest::withoutAttribute` when attribute value is null.
+
+
+## [1.3.0] - 2016-04-13
+
+### Added
+
+- Remaining interfaces needed for full PSR7 compatibility
+  (ServerRequestInterface, UploadedFileInterface, etc.).
+- Support for stream_for from scalars.
+
+### Changed
+
+- Can now extend Uri.
+
+### Fixed
+- A bug in validating request methods by making it more permissive.
+
+
+## [1.2.3] - 2016-02-18
+
+### Fixed
+
+- Support in `GuzzleHttp\Psr7\CachingStream` for seeking forward on remote
+  streams, which can sometimes return fewer bytes than requested with `fread`.
+- Handling of gzipped responses with FNAME headers.
+
+
+## [1.2.2] - 2016-01-22
+
+### Added
+
+- Support for URIs without any authority.
+- Support for HTTP 451 'Unavailable For Legal Reasons.'
+- Support for using '0' as a filename.
+- Support for including non-standard ports in Host headers.
+
+
+## [1.2.1] - 2015-11-02
+
+### Changes
+
+- Now supporting negative offsets when seeking to SEEK_END.
+
+
+## [1.2.0] - 2015-08-15
+
+### Changed
+
+- Body as `"0"` is now properly added to a response.
+- Now allowing forward seeking in CachingStream.
+- Now properly parsing HTTP requests that contain proxy targets in
+  `parse_request`.
+- functions.php is now conditionally required.
+- user-info is no longer dropped when resolving URIs.
+
+
+## [1.1.0] - 2015-06-24
+
+### Changed
+
+- URIs can now be relative.
+- `multipart/form-data` headers are now overridden case-insensitively.
+- URI paths no longer encode the following characters because they are allowed
+  in URIs: "(", ")", "*", "!", "'"
+- A port is no longer added to a URI when the scheme is missing and no port is
+  present.
+
+
+## 1.0.0 - 2015-05-19
+
+Initial release.
+
+Currently unsupported:
+
+- `Psr\Http\Message\ServerRequestInterface`
+- `Psr\Http\Message\UploadedFileInterface`
+
+
+
+[1.6.0]: https://github.com/guzzle/psr7/compare/1.5.2...1.6.0
+[1.5.2]: https://github.com/guzzle/psr7/compare/1.5.1...1.5.2
+[1.5.1]: https://github.com/guzzle/psr7/compare/1.5.0...1.5.1
+[1.5.0]: https://github.com/guzzle/psr7/compare/1.4.2...1.5.0
+[1.4.2]: https://github.com/guzzle/psr7/compare/1.4.1...1.4.2
+[1.4.1]: https://github.com/guzzle/psr7/compare/1.4.0...1.4.1
+[1.4.0]: https://github.com/guzzle/psr7/compare/1.3.1...1.4.0
+[1.3.1]: https://github.com/guzzle/psr7/compare/1.3.0...1.3.1
+[1.3.0]: https://github.com/guzzle/psr7/compare/1.2.3...1.3.0
+[1.2.3]: https://github.com/guzzle/psr7/compare/1.2.2...1.2.3
+[1.2.2]: https://github.com/guzzle/psr7/compare/1.2.1...1.2.2
+[1.2.1]: https://github.com/guzzle/psr7/compare/1.2.0...1.2.1
+[1.2.0]: https://github.com/guzzle/psr7/compare/1.1.0...1.2.0
+[1.1.0]: https://github.com/guzzle/psr7/compare/1.0.0...1.1.0
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        {
+    "name": "guzzlehttp/psr7",
+    "description": "PSR-7 message implementation that also provides common utility methods",
+    "keywords": [
+        "request",
+        "response",
+        "message",
+        "stream",
+        "http",
+        "uri",
+        "url",
+        "psr-7"
+    ],
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Graham Campbell",
+            "email": "hello@gjcampbell.co.uk",
+            "homepage": "https://github.com/GrahamCampbell"
+        },
+        {
+            "name": "Michael Dowling",
+            "email": "mtdowling@gmail.com",
+            "homepage": "https://github.com/mtdowling"
+        },
+        {
+            "name": "George Mponos",
+            "email": "gmponos@gmail.com",
+            "homepage": "https://github.com/gmponos"
+        },
+        {
+            "name": "Tobias Nyholm",
+            "email": "tobias.nyholm@gmail.com",
+            "homepage": "https://github.com/Nyholm"
+        },
+        {
+            "name": "Márk Sági-Kazár",
+            "email": "mark.sagikazar@gmail.com",
+            "homepage": "https://github.com/sagikazarmark"
+        },
+        {
+            "name": "Tobias Schultze",
+            "email": "webmaster@tubo-world.de",
+            "homepage": "https://github.com/Tobion"
+        },
+        {
+            "name": "Márk Sági-Kazár",
+            "email": "mark.sagikazar@gmail.com",
+            "homepage": "https://sagikazarmark.hu"
+        }
+    ],
+    "require": {
+        "php": "^7.2.5 || ^8.0",
+        "psr/http-factory": "^1.0",
+        "psr/http-message": "^1.1 || ^2.0",
+        "ralouphie/getallheaders": "^3.0"
+    },
+    "provide": {
+        "psr/http-factory-implementation": "1.0",
+        "psr/http-message-implementation": "1.0"
+    },
+    "require-dev": {
+        "bamarni/composer-bin-plugin": "^1.8.2",
+        "http-interop/http-factory-tests": "^0.9",
+        "phpunit/phpunit": "^8.5.36 || ^9.6.15"
+    },
+    "suggest": {
+        "laminas/laminas-httphandlerrunner": "Emit PSR-7 responses"
+    },
+    "autoload": {
+        "psr-4": {
+            "GuzzleHttp\\Psr7\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "GuzzleHttp\\Tests\\Psr7\\": "tests/"
+        }
+    },
+    "extra": {
+        "bamarni-bin": {
+            "bin-links": true,
+            "forward-command": false
+        }
+    },
+    "config": {
+        "allow-plugins": {
+            "bamarni/composer-bin-plugin": true
+        },
+        "preferred-install": "dist",
+        "sort-packages": true
+    }
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    The MIT License (MIT)
+
+Copyright (c) 2015 Michael Dowling <mtdowling@gmail.com>
+Copyright (c) 2015 Márk Sági-Kazár <mark.sagikazar@gmail.com>
+Copyright (c) 2015 Graham Campbell <hello@gjcampbell.co.uk>
+Copyright (c) 2016 Tobias Schultze <webmaster@tubo-world.de>
+Copyright (c) 2016 George Mponos <gmponos@gmail.com>
+Copyright (c) 2018 Tobias Nyholm <tobias.nyholm@gmail.com>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      # PSR-7 Message Implementation
+
+This repository contains a full [PSR-7](https://www.php-fig.org/psr/psr-7/)
+message implementation, several stream decorators, and some helpful
+functionality like query string parsing.
+
+![CI](https://github.com/guzzle/psr7/workflows/CI/badge.svg)
+![Static analysis](https://github.com/guzzle/psr7/workflows/Static%20analysis/badge.svg)
+
+
+## Features
+
+This package comes with a number of stream implementations and stream
+decorators.
+
+
+## Installation
+
+```shell
+composer require guzzlehttp/psr7
+```
+
+## Version Guidance
+
+| Version | Status              | PHP Version  |
+|---------|---------------------|--------------|
+| 1.x     | Security fixes only | >=5.4,<8.1   |
+| 2.x     | Latest              | >=7.2.5,<8.4 |
+
+
+## AppendStream
+
+`GuzzleHttp\Psr7\AppendStream`
+
+Reads from multiple streams, one after the other.
+
+```php
+use GuzzleHttp\Psr7;
+
+$a = Psr7\Utils::streamFor('abc, ');
+$b = Psr7\Utils::streamFor('123.');
+$composed = new Psr7\AppendStream([$a, $b]);
+
+$composed->addStream(Psr7\Utils::streamFor(' Above all listen to me'));
+
+echo $composed; // abc, 123. Above all listen to me.
+```
+
+
+## BufferStream
+
+`GuzzleHttp\Psr7\BufferStream`
+
+Provides a buffer stream that can be written to fill a buffer, and read
+from to remove bytes from the buffer.
+
+This stream returns a "hwm" metadata value that tells upstream consumers
+what the configured high water mark of the stream is, or the maximum
+preferred size of the buffer.
+
+```php
+use GuzzleHttp\Psr7;
+
+// When more than 1024 bytes are in the buffer, it will begin returning
+// false to writes. This is an indication that writers should slow down.
+$buffer = new Psr7\BufferStream(1024);
+```
+
+
+## CachingStream
+
+The CachingStream is used to allow seeking over previously read bytes on
+non-seekable streams. This can be useful when transferring a non-seekable
+entity body fails due to needing to rewind the stream (for example, resulting
+from a redirect). Data that is read from the remote stream will be buffered in
+a PHP temp stream so that previously read bytes are cached first in memory,
+then on disk.
+
+```php
+use GuzzleHttp\Psr7;
+
+$original = Psr7\Utils::streamFor(fopen('http://www.google.com', 'r'));
+$stream = new Psr7\CachingStream($original);
+
+$stream->read(1024);
+echo $stream->tell();
+// 1024
+
+$stream->seek(0);
+echo $stream->tell();
+// 0
+```
+
+
+## DroppingStream
+
+`GuzzleHttp\Psr7\DroppingStream`
+
+Stream decorator that begins dropping data once the size of the underlying
+stream becomes too full.
+
+```php
+use GuzzleHttp\Psr7;
+
+// Create an empty stream
+$stream = Psr7\Utils::streamFor();
+
+// Start dropping data when the stream has more than 10 bytes
+$dropping = new Psr7\DroppingStream($stream, 10);
+
+$dropping->write('01234567890123456789');
+echo $stream; // 0123456789
+```
+
+
+## FnStream
+
+`GuzzleHttp\Psr7\FnStream`
+
+Compose stream implementations based on a hash of functions.
+
+Allows for easy testing and extension of a provided stream without needing
+to create a concrete class for a simple extension point.
+
+```php
+
+use GuzzleHttp\Psr7;
+
+$stream = Psr7\Utils::streamFor('hi');
+$fnStream = Psr7\FnStream::decorate($stream, [
+    'rewind' => function () use ($stream) {
+        echo 'About to rewind - ';
+        $stream->rewind();
+        echo 'rewound!';
+    }
+]);
+
+$fnStream->rewind();
+// Outputs: About to rewind - rewound!
+```
+
+
+## InflateStream
+
+`GuzzleHttp\Psr7\InflateStream`
+
+Uses PHP's zlib.inflate filter to inflate zlib (HTTP deflate, RFC1950) or gzipped (RFC1952) content.
+
+This stream decorator converts the provided stream to a PHP stream resource,
+then appends the zlib.inflate filter. The stream is then converted back
+to a Guzzle stream resource to be used as a Guzzle stream.
+
+
+## LazyOpenStream
+
+`GuzzleHttp\Psr7\LazyOpenStream`
+
+Lazily reads or writes to a file that is opened only after an IO operation
+take place on the stream.
+
+```php
+use GuzzleHttp\Psr7;
+
+$stream = new Psr7\LazyOpenStream('/path/to/file', 'r');
+// The file has not yet been opened...
+
+echo $stream->read(10);
+// The file is opened and read from only when needed.
+```
+
+
+## LimitStream
+
+`GuzzleHttp\Psr7\LimitStream`
+
+LimitStream can be used to read a subset or slice of an existing stream object.
+This can be useful for breaking a large file into smaller pieces to be sent in
+chunks (e.g. Amazon S3's multipart upload API).
+
+```php
+use GuzzleHttp\Psr7;
+
+$original = Psr7\Utils::streamFor(fopen('/tmp/test.txt', 'r+'));
+echo $original->getSize();
+// >>> 1048576
+
+// Limit the size of the body to 1024 bytes and start reading from byte 2048
+$stream = new Psr7\LimitStream($original, 1024, 2048);
+echo $stream->getSize();
+// >>> 1024
+echo $stream->tell();
+// >>> 0
+```
+
+
+## MultipartStream
+
+`GuzzleHttp\Psr7\MultipartStream`
+
+Stream that when read returns bytes for a streaming multipart or
+multipart/form-data stream.
+
+
+## NoSeekStream
+
+`GuzzleHttp\Psr7\NoSeekStream`
+
+NoSeekStream wraps a stream and does not allow seeking.
+
+```php
+use GuzzleHttp\Psr7;
+
+$original = Psr7\Utils::streamFor('foo');
+$noSeek = new Psr7\NoSeekStream($original);
+
+echo $noSeek->read(3);
+// foo
+var_export($noSeek->isSeekable());
+// false
+$noSeek->seek(0);
+var_export($noSeek->read(3));
+// NULL
+```
+
+
+## PumpStream
+
+`GuzzleHttp\Psr7\PumpStream`
+
+Provides a read only stream that pumps data from a PHP callable.
+
+When invoking the provided callable, the PumpStream will pass the amount of
+data requested to read to the callable. The callable can choose to ignore
+this value and return fewer or more bytes than requested. Any extra data
+returned by the provided callable is buffered internally until drained using
+the read() function of the PumpStream. The provided callable MUST return
+false when there is no more data to read.
+
+
+## Implementing stream decorators
+
+Creating a stream decorator is very easy thanks to the
+`GuzzleHttp\Psr7\StreamDecoratorTrait`. This trait provides methods that
+implement `Psr\Http\Message\StreamInterface` by proxying to an underlying
+stream. Just `use` the `StreamDecoratorTrait` and implement your custom
+methods.
+
+For example, let's say we wanted to call a specific function each time the last
+byte is read from a stream. This could be implemented by overriding the
+`read()` method.
+
+```php
+use Psr\Http\Message\StreamInterface;
+use GuzzleHttp\Psr7\StreamDecoratorTrait;
+
+class EofCallbackStream implements StreamInterface
+{
+    use StreamDecoratorTrait;
+
+    private $callback;
+
+    private $stream;
+
+    public function __construct(StreamInterface $stream, callable $cb)
+    {
+        $this->stream = $stream;
+        $this->callback = $cb;
+    }
+
+    public function read($length)
+    {
+        $result = $this->stream->read($length);
+
+        // Invoke the callback when EOF is hit.
+        if ($this->eof()) {
+            ($this->callback)();
+        }
+
+        return $result;
+    }
+}
+```
+
+This decorator could be added to any existing stream and used like so:
+
+```php
+use GuzzleHttp\Psr7;
+
+$original = Psr7\Utils::streamFor('foo');
+
+$eofStream = new EofCallbackStream($original, function () {
+    echo 'EOF!';
+});
+
+$eofStream->read(2);
+$eofStream->read(1);
+// echoes "EOF!"
+$eofStream->seek(0);
+$eofStream->read(3);
+// echoes "EOF!"
+```
+
+
+## PHP StreamWrapper
+
+You can use the `GuzzleHttp\Psr7\StreamWrapper` class if you need to use a
+PSR-7 stream as a PHP stream resource.
+
+Use the `GuzzleHttp\Psr7\StreamWrapper::getResource()` method to create a PHP
+stream from a PSR-7 stream.
+
+```php
+use GuzzleHttp\Psr7\StreamWrapper;
+
+$stream = GuzzleHttp\Psr7\Utils::streamFor('hello!');
+$resource = StreamWrapper::getResource($stream);
+echo fread($resource, 6); // outputs hello!
+```
+
+
+# Static API
+
+There are various static methods available under the `GuzzleHttp\Psr7` namespace.
+
+
+## `GuzzleHttp\Psr7\Message::toString`
+
+`public static function toString(MessageInterface $message): string`
+
+Returns the string representation of an HTTP message.
+
+```php
+$request = new GuzzleHttp\Psr7\Request('GET', 'http://example.com');
+echo GuzzleHttp\Psr7\Message::toString($request);
+```
+
+
+## `GuzzleHttp\Psr7\Message::bodySummary`
+
+`public static function bodySummary(MessageInterface $message, int $truncateAt = 120): string|null`
+
+Get a short summary of the message body.
+
+Will return `null` if the response is not printable.
+
+
+## `GuzzleHttp\Psr7\Message::rewindBody`
+
+`public static function rewindBody(MessageInterface $message): void`
+
+Attempts to rewind a message body and throws an exception on failure.
+
+The body of the message will only be rewound if a call to `tell()`
+returns a value other than `0`.
+
+
+## `GuzzleHttp\Psr7\Message::parseMessage`
+
+`public static function parseMessage(string $message): array`
+
+Parses an HTTP message into an associative array.
+
+The array contains the "start-line" key containing the start line of
+the message, "headers" key containing an associative array of header
+array values, and a "body" key containing the body of the message.
+
+
+## `GuzzleHttp\Psr7\Message::parseRequestUri`
+
+`public static function parseRequestUri(string $path, array $headers): string`
+
+Constructs a URI for an HTTP request message.
+
+
+## `GuzzleHttp\Psr7\Message::parseRequest`
+
+`public static function parseRequest(string $message): Request`
+
+Parses a request message string into a request object.
+
+
+## `GuzzleHttp\Psr7\Message::parseResponse`
+
+`public static function parseResponse(string $message): Response`
+
+Parses a response message string into a response object.
+
+
+## `GuzzleHttp\Psr7\Header::parse`
+
+`public static function parse(string|array $header): array`
+
+Parse an array of header values containing ";" separated data into an
+array of associative arrays representing the header key value pair data
+of the header. When a parameter does not contain a value, but just
+contains a key, this function will inject a key with a '' string value.
+
+
+## `GuzzleHttp\Psr7\Header::splitList`
+
+`public static function splitList(string|string[] $header): string[]`
+
+Splits a HTTP header defined to contain a comma-separated list into
+each individual value:
+
+```
+$knownEtags = Header::splitList($request->getHeader('if-none-match'));
+```
+
+Example headers include `accept`, `cache-control` and `if-none-match`.
+
+
+## `GuzzleHttp\Psr7\Header::normalize` (deprecated)
+
+`public static function normalize(string|array $header): array`
+
+`Header::normalize()` is deprecated in favor of [`Header::splitList()`](README.md#guzzlehttppsr7headersplitlist)
+which performs the same operation with a cleaned up API and improved
+documentation.
+
+Converts an array of header values that may contain comma separated
+headers into an array of headers with no comma separated values.
+
+
+## `GuzzleHttp\Psr7\Query::parse`
+
+`public static function parse(string $str, int|bool $urlEncoding = true): array`
+
+Parse a query string into an associative array.
+
+If multiple values are found for the same key, the value of that key
+value pair will become an array. This function does not parse nested
+PHP style arrays into an associative array (e.g., `foo[a]=1&foo[b]=2`
+will be parsed into `['foo[a]' => '1', 'foo[b]' => '2'])`.
+
+
+## `GuzzleHttp\Psr7\Query::build`
+
+`public static function build(array $params, int|false $encoding = PHP_QUERY_RFC3986): string`
+
+Build a query string from an array of key value pairs.
+
+This function can use the return value of `parse()` to build a query
+string. This function does not modify the provided keys when an array is
+encountered (like `http_build_query()` would).
+
+
+## `GuzzleHttp\Psr7\Utils::caselessRemove`
+
+`public static function caselessRemove(iterable<string> $keys, $keys, array $data): array`
+
+Remove the items given by the keys, case insensitively from the data.
+
+
+## `GuzzleHttp\Psr7\Utils::copyToStream`
+
+`public static function copyToStream(StreamInterface $source, StreamInterface $dest, int $maxLen = -1): void`
+
+Copy the contents of a stream into another stream until the given number
+of bytes have been read.
+
+
+## `GuzzleHttp\Psr7\Utils::copyToString`
+
+`public static function copyToString(StreamInterface $stream, int $maxLen = -1): string`
+
+Copy the contents of a stream into a string until the given number of
+bytes have been read.
+
+
+## `GuzzleHttp\Psr7\Utils::hash`
+
+`public static function hash(StreamInterface $stream, string $algo, bool $rawOutput = false): string`
+
+Calculate a hash of a stream.
+
+This method reads the entire stream to calculate a rolling hash, based on
+PHP's `hash_init` functions.
+
+
+## `GuzzleHttp\Psr7\Utils::modifyRequest`
+
+`public static function modifyRequest(RequestInterface $request, array $changes): RequestInterface`
+
+Clone and modify a request with the given changes.
+
+This method is useful for reducing the number of clones needed to mutate
+a message.
+
+- method: (string) Changes the HTTP method.
+- set_headers: (array) Sets the given headers.
+- remove_headers: (array) Remove the given headers.
+- body: (mixed) Sets the given body.
+- uri: (UriInterface) Set the URI.
+- query: (string) Set the query string value of the URI.
+- version: (string) Set the protocol version.
+
+
+## `GuzzleHttp\Psr7\Utils::readLine`
+
+`public static function readLine(StreamInterface $stream, int $maxLength = null): string`
+
+Read a line from the stream up to the maximum allowed buffer length.
+
+
+## `GuzzleHttp\Psr7\Utils::streamFor`
+
+`public static function streamFor(resource|string|null|int|float|bool|StreamInterface|callable|\Iterator $resource = '', array $options = []): StreamInterface`
+
+Create a new stream based on the input type.
+
+Options is an associative array that can contain the following keys:
+
+- metadata: Array of custom metadata.
+- size: Size of the stream.
+
+This method accepts the following `$resource` types:
+
+- `Psr\Http\Message\StreamInterface`: Returns the value as-is.
+- `string`: Creates a stream object that uses the given string as the contents.
+- `resource`: Creates a stream object that wraps the given PHP stream resource.
+- `Iterator`: If the provided value implements `Iterator`, then a read-only
+  stream object will be created that wraps the given iterable. Each time the
+  stream is read from, data from the iterator will fill a buffer and will be
+  continuously called until the buffer is equal to the requested read size.
+  Subsequent read calls will first read from the buffer and then call `next`
+  on the underlying iterator until it is exhausted.
+- `object` with `__toString()`: If the object has the `__toString()` method,
+  the object will be cast to a string and then a stream will be returned that
+  uses the string value.
+- `NULL`: When `null` is passed, an empty stream object is returned.
+- `callable` When a callable is passed, a read-only stream object will be
+  created that invokes the given callable. The callable is invoked with the
+  number of suggested bytes to read. The callable can return any number of
+  bytes, but MUST return `false` when there is no more data to return. The
+  stream object that wraps the callable will invoke the callable until the
+  number of requested bytes are available. Any additional bytes will be
+  buffered and used in subsequent reads.
+
+```php
+$stream = GuzzleHttp\Psr7\Utils::streamFor('foo');
+$stream = GuzzleHttp\Psr7\Utils::streamFor(fopen('/path/to/file', 'r'));
+
+$generator = function ($bytes) {
+    for ($i = 0; $i < $bytes; $i++) {
+        yield ' ';
+    }
+}
+
+$stream = GuzzleHttp\Psr7\Utils::streamFor($generator(100));
+```
+
+
+## `GuzzleHttp\Psr7\Utils::tryFopen`
+
+`public static function tryFopen(string $filename, string $mode): resource`
+
+Safely opens a PHP stream resource using a filename.
+
+When fopen fails, PHP normally raises a warning. This function adds an
+error handler that checks for errors and throws an exception instead.
+
+
+## `GuzzleHttp\Psr7\Utils::tryGetContents`
+
+`public static function tryGetContents(resource $stream): string`
+
+Safely gets the contents of a given stream.
+
+When stream_get_contents fails, PHP normally raises a warning. This
+function adds an error handler that checks for errors and throws an
+exception instead.
+
+
+## `GuzzleHttp\Psr7\Utils::uriFor`
+
+`public static function uriFor(string|UriInterface $uri): UriInterface`
+
+Returns a UriInterface for the given value.
+
+This function accepts a string or UriInterface and returns a
+UriInterface for the given value. If the value is already a
+UriInterface, it is returned as-is.
+
+
+## `GuzzleHttp\Psr7\MimeType::fromFilename`
+
+`public static function fromFilename(string $filename): string|null`
+
+Determines the mimetype of a file by looking at its extension.
+
+
+## `GuzzleHttp\Psr7\MimeType::fromExtension`
+
+`public static function fromExtension(string $extension): string|null`
+
+Maps a file extensions to a mimetype.
+
+
+## Upgrading from Function API
+
+The static API was first introduced in 1.7.0, in order to mitigate problems with functions conflicting between global and local copies of the package. The function API was removed in 2.0.0. A migration table has been provided here for your convenience:
+
+| Original Function | Replacement Method |
+|----------------|----------------|
+| `str` | `Message::toString` |
+| `uri_for` | `Utils::uriFor` |
+| `stream_for` | `Utils::streamFor` |
+| `parse_header` | `Header::parse` |
+| `normalize_header` | `Header::normalize` |
+| `modify_request` | `Utils::modifyRequest` |
+| `rewind_body` | `Message::rewindBody` |
+| `try_fopen` | `Utils::tryFopen` |
+| `copy_to_string` | `Utils::copyToString` |
+| `copy_to_stream` | `Utils::copyToStream` |
+| `hash` | `Utils::hash` |
+| `readline` | `Utils::readLine` |
+| `parse_request` | `Message::parseRequest` |
+| `parse_response` | `Message::parseResponse` |
+| `parse_query` | `Query::parse` |
+| `build_query` | `Query::build` |
+| `mimetype_from_filename` | `MimeType::fromFilename` |
+| `mimetype_from_extension` | `MimeType::fromExtension` |
+| `_parse_message` | `Message::parseMessage` |
+| `_parse_request_uri` | `Message::parseRequestUri` |
+| `get_message_body_summary` | `Message::bodySummary` |
+| `_caseless_remove` | `Utils::caselessRemove` |
+
+
+# Additional URI Methods
+
+Aside from the standard `Psr\Http\Message\UriInterface` implementation in form of the `GuzzleHttp\Psr7\Uri` class,
+this library also provides additional functionality when working with URIs as static methods.
+
+## URI Types
+
+An instance of `Psr\Http\Message\UriInterface` can either be an absolute URI or a relative reference.
+An absolute URI has a scheme. A relative reference is used to express a URI relative to another URI,
+the base URI. Relative references can be divided into several forms according to
+[RFC 3986 Section 4.2](https://datatracker.ietf.org/doc/html/rfc3986#section-4.2):
+
+- network-path references, e.g. `//example.com/path`
+- absolute-path references, e.g. `/path`
+- relative-path references, e.g. `subpath`
+
+The following methods can be used to identify the type of the URI.
+
+### `GuzzleHttp\Psr7\Uri::isAbsolute`
+
+`public static function isAbsolute(UriInterface $uri): bool`
+
+Whether the URI is absolute, i.e. it has a scheme.
+
+### `GuzzleHttp\Psr7\Uri::isNetworkPathReference`
+
+`public static function isNetworkPathReference(UriInterface $uri): bool`
+
+Whether the URI is a network-path reference. A relative reference that begins with two slash characters is
+termed an network-path reference.
+
+### `GuzzleHttp\Psr7\Uri::isAbsolutePathReference`
+
+`public static function isAbsolutePathReference(UriInterface $uri): bool`
+
+Whether the URI is a absolute-path reference. A relative reference that begins with a single slash character is
+termed an absolute-path reference.
+
+### `GuzzleHttp\Psr7\Uri::isRelativePathReference`
+
+`public static function isRelativePathReference(UriInterface $uri): bool`
+
+Whether the URI is a relative-path reference. A relative reference that does not begin with a slash character is
+termed a relative-path reference.
+
+### `GuzzleHttp\Psr7\Uri::isSameDocumentReference`
+
+`public static function isSameDocumentReference(UriInterface $uri, UriInterface $base = null): bool`
+
+Whether the URI is a same-document reference. A same-document reference refers to a URI that is, aside from its
+fragment component, identical to the base URI. When no base URI is given, only an empty URI reference
+(apart from its fragment) is considered a same-document reference.
+
+## URI Components
+
+Additional methods to work with URI components.
+
+### `GuzzleHttp\Psr7\Uri::isDefaultPort`
+
+`public static function isDefaultPort(UriInterface $uri): bool`
+
+Whether the URI has the default port of the current scheme. `Psr\Http\Message\UriInterface::getPort` may return null
+or the standard port. This method can be used independently of the implementation.
+
+### `GuzzleHttp\Psr7\Uri::composeComponents`
+
+`public static function composeComponents($scheme, $authority, $path, $query, $fragment): string`
+
+Composes a URI reference string from its various components according to
+[RFC 3986 Section 5.3](https://datatracker.ietf.org/doc/html/rfc3986#section-5.3). Usually this method does not need
+to be called manually but instead is used indirectly via `Psr\Http\Message\UriInterface::__toString`.
+
+### `GuzzleHttp\Psr7\Uri::fromParts`
+
+`public static function fromParts(array $parts): UriInterface`
+
+Creates a URI from a hash of [`parse_url`](https://www.php.net/manual/en/function.parse-url.php) components.
+
+
+### `GuzzleHttp\Psr7\Uri::withQueryValue`
+
+`public static function withQueryValue(UriInterface $uri, $key, $value): UriInterface`
+
+Creates a new URI with a specific query string value. Any existing query string values that exactly match the
+provided key are removed and replaced with the given key value pair. A value of null will set the query string
+key without a value, e.g. "key" instead of "key=value".
+
+### `GuzzleHttp\Psr7\Uri::withQueryValues`
+
+`public static function withQueryValues(UriInterface $uri, array $keyValueArray): UriInterface`
+
+Creates a new URI with multiple query string values. It has the same behavior as `withQueryValue()` but for an
+associative array of key => value.
+
+### `GuzzleHttp\Psr7\Uri::withoutQueryValue`
+
+`public static function withoutQueryValue(UriInterface $uri, $key): UriInterface`
+
+Creates a new URI with a specific query string value removed. Any existing query string values that exactly match the
+provided key are removed.
+
+## Cross-Origin Detection
+
+`GuzzleHttp\Psr7\UriComparator` provides methods to determine if a modified URL should be considered cross-origin.
+
+### `GuzzleHttp\Psr7\UriComparator::isCrossOrigin`
+
+`public static function isCrossOrigin(UriInterface $original, UriInterface $modified): bool`
+
+Determines if a modified URL should be considered cross-origin with respect to an original URL.
+
+## Reference Resolution
+
+`GuzzleHttp\Psr7\UriResolver` provides methods to resolve a URI reference in the context of a base URI according
+to [RFC 3986 Section 5](https://datatracker.ietf.org/doc/html/rfc3986#section-5). This is for example also what web
+browsers do when resolving a link in a website based on the current request URI.
+
+### `GuzzleHttp\Psr7\UriResolver::resolve`
+
+`public static function resolve(UriInterface $base, UriInterface $rel): UriInterface`
+
+Converts the relative URI into a new URI that is resolved against the base URI.
+
+### `GuzzleHttp\Psr7\UriResolver::removeDotSegments`
+
+`public static function removeDotSegments(string $path): string`
+
+Removes dot segments from a path and returns the new path according to
+[RFC 3986 Section 5.2.4](https://datatracker.ietf.org/doc/html/rfc3986#section-5.2.4).
+
+### `GuzzleHttp\Psr7\UriResolver::relativize`
+
+`public static function relativize(UriInterface $base, UriInterface $target): UriInterface`
+
+Returns the target URI as a relative reference from the base URI. This method is the counterpart to resolve():
+
+```php
+(string) $target === (string) UriResolver::resolve($base, UriResolver::relativize($base, $target))
+```
+
+One use-case is to use the current request URI as base URI and then generate relative links in your documents
+to reduce the document size or offer self-contained downloadable document archives.
+
+```php
+$base = new Uri('http://example.com/a/b/');
+echo UriResolver::relativize($base, new Uri('http://example.com/a/b/c'));  // prints 'c'.
+echo UriResolver::relativize($base, new Uri('http://example.com/a/x/y'));  // prints '../x/y'.
+echo UriResolver::relativize($base, new Uri('http://example.com/a/b/?q')); // prints '?q'.
+echo UriResolver::relativize($base, new Uri('http://example.org/a/b/'));   // prints '//example.org/a/b/'.
+```
+
+## Normalization and Comparison
+
+`GuzzleHttp\Psr7\UriNormalizer` provides methods to normalize and compare URIs according to
+[RFC 3986 Section 6](https://datatracker.ietf.org/doc/html/rfc3986#section-6).
+
+### `GuzzleHttp\Psr7\UriNormalizer::normalize`
+
+`public static function normalize(UriInterface $uri, $flags = self::PRESERVING_NORMALIZATIONS): UriInterface`
+
+Returns a normalized URI. The scheme and host component are already normalized to lowercase per PSR-7 UriInterface.
+This methods adds additional normalizations that can be configured with the `$flags` parameter which is a bitmask
+of normalizations to apply. The following normalizations are available:
+
+- `UriNormalizer::PRESERVING_NORMALIZATIONS`
+
+    Default normalizations which only include the ones that preserve semantics.
+
+- `UriNormalizer::CAPITALIZE_PERCENT_ENCODING`
+
+    All letters within a percent-encoding triplet (e.g., "%3A") are case-insensitive, and should be capitalized.
+
+    Example: `http://example.org/a%c2%b1b` → `http://example.org/a%C2%B1b`
+
+- `UriNormalizer::DECODE_UNRESERVED_CHARACTERS`
+
+    Decodes percent-encoded octets of unreserved characters. For consistency, percent-encoded octets in the ranges of
+    ALPHA (%41–%5A and %61–%7A), DIGIT (%30–%39), hyphen (%2D), period (%2E), underscore (%5F), or tilde (%7E) should
+    not be created by URI producers and, when found in a URI, should be decoded to their corresponding unreserved
+    characters by URI normalizers.
+
+    Example: `http://example.org/%7Eusern%61me/` → `http://example.org/~username/`
+
+- `UriNormalizer::CONVERT_EMPTY_PATH`
+
+    Converts the empty path to "/" for http and https URIs.
+
+    Example: `http://example.org` → `http://example.org/`
+
+- `UriNormalizer::REMOVE_DEFAULT_HOST`
+
+    Removes the default host of the given URI scheme from the URI. Only the "file" scheme defines the default host
+    "localhost". All of `file:/myfile`, `file:///myfile`, and `file://localhost/myfile` are equivalent according to
+    RFC 3986.
+
+    Example: `file://localhost/myfile` → `file:///myfile`
+
+- `UriNormalizer::REMOVE_DEFAULT_PORT`
+
+    Removes the default port of the given URI scheme from the URI.
+
+    Example: `http://example.org:80/` → `http://example.org/`
+
+- `UriNormalizer::REMOVE_DOT_SEGMENTS`
+
+    Removes unnecessary dot-segments. Dot-segments in relative-path references are not removed as it would
+    change the semantics of the URI reference.
+
+    Example: `http://example.org/../a/b/../c/./d.html` → `http://example.org/a/c/d.html`
+
+- `UriNormalizer::REMOVE_DUPLICATE_SLASHES`
+
+    Paths which include two or more adjacent slashes are converted to one. Webservers usually ignore duplicate slashes
+    and treat those URIs equivalent. But in theory those URIs do not need to be equivalent. So this normalization
+    may change the semantics. Encoded slashes (%2F) are not removed.
+
+    Example: `http://example.org//foo///bar.html` → `http://example.org/foo/bar.html`
+
+- `UriNormalizer::SORT_QUERY_PARAMETERS`
+
+    Sort query parameters with their values in alphabetical order. However, the order of parameters in a URI may be
+    significant (this is not defined by the standard). So this normalization is not safe and may change the semantics
+    of the URI.
+
+    Example: `?lang=en&article=fred` → `?article=fred&lang=en`
+
+### `GuzzleHttp\Psr7\UriNormalizer::isEquivalent`
+
+`public static function isEquivalent(UriInterface $uri1, UriInterface $uri2, $normalizations = self::PRESERVING_NORMALIZATIONS): bool`
+
+Whether two URIs can be considered equivalent. Both URIs are normalized automatically before comparison with the given
+`$normalizations` bitmask. The method also accepts relative URI references and returns true when they are equivalent.
+This of course assumes they will be resolved against the same base URI. If this is not the case, determination of
+equivalence or difference of relative references does not mean anything.
+
+
+## Security
+
+If you discover a security vulnerability within this package, please send an email to security@tidelift.com. All security vulnerabilities will be promptly addressed. Please do not disclose security-related issues publicly until a fix has been announced. Please see [Security Policy](https://github.com/guzzle/psr7/security/policy) for more information.
+
+
+## License
+
+Guzzle is made available under the MIT License (MIT). Please see [License File](LICENSE) for more information.
+
+
+## For Enterprise
+
+Available as part of the Tidelift Subscription
+
+The maintainers of Guzzle and thousands of other packages are working with Tidelift to deliver commercial support and maintenance for the open source dependencies you use to build your applications. Save time, reduce risk, and improve code health, while paying the maintainers of the exact dependencies you use. [Learn more.](https://tidelift.com/subscription/pkg/packagist-guzzlehttp-psr7?utm_source=packagist-guzzlehttp-psr7&utm_medium=referral&utm_campaign=enterprise&utm_term=repo)
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      <?php
+
+declare(strict_types=1);
+
+namespace GuzzleHttp\Psr7;
+
+use Psr\Http\Message\StreamInterface;
+
+/**
+ * Reads from multiple streams, one after the other.
+ *
+ * This is a read-only stream decorator.
+ */
+final class AppendStream implements StreamInterface
+{
+    /** @var StreamInterface[] Streams being decorated */
+    private $streams = [];
+
+    /** @var bool */
+    private $seekable = true;
+
+    /** @var int */
+    private $current = 0;
+
+    /** @var int */
+    private $pos = 0;
+
+    /**
+     * @param StreamInterface[] $streams Streams to decorate. Each stream must
+     *                                   be readable.
+     */
+    public function __construct(array $streams = [])
+    {
+        foreach ($streams as $stream) {
+            $this->addStream($stream);
+        }
+    }
+
+    public function __toString(): string
+    {
+        try {
+            $this->rewind();
+
+            return $this->getContents();
+        } catch (\Throwable $e) {
+            if (\PHP_VERSION_ID >= 70400) {
+                throw $e;
+            }
+            trigger_error(sprintf('%s::__toString exception: %s', self::class, (string) $e), E_USER_ERROR);
+
+            return '';
+        }
+    }
+
+    /**
+     * Add a stream to the AppendStream
+     *
+     * @param StreamInterface $stream Stream to append. Must be readable.
+     *
+     * @throws \InvalidArgumentException if the stream is not readable
+     */
+    public function addStream(StreamInterface $stream): void
+    {
+        if (!$stream->isReadable()) {
+            throw new \InvalidArgumentException('Each stream must be readable');
+        }
+
+        // The stream is only seekable if all streams are seekable
+        if (!$stream->isSeekable()) {
+            $this->seekable = false;
+        }
+
+        $this->streams[] = $stream;
+    }
+
+    public function getContents(): string
+    {
+        return Utils::copyToString($this);
+    }
+
+    /**
+     * Closes each attached stream.
+     */
+    public function close(): void
+    {
+        $this->pos = $this->current = 0;
+        $this->seekable = true;
+
+        foreach ($this->streams as $stream) {
+            $stream->close();
+        }
+
+        $this->streams = [];
+    }
+
+    /**
+     * Detaches each attached stream.
+     *
+     * Returns null as it's not clear which underlying stream resource to return.
+     */
+    public function detach()
+    {
+        $this->pos = $this->current = 0;
+        $this->seekable = true;
+
+        foreach ($this->streams as $stream) {
+            $stream->detach();
+        }
+
+        $this->streams = [];
+
+        return null;
+    }
+
+    public function tell(): int
+    {
+        return $this->pos;
+    }
+
+    /**
+     * Tries to calculate the size by adding the size of each stream.
+     *
+     * If any of the streams do not return a valid number, then the size of the
+     * append stream cannot be determined and null is returned.
+     */
+    public function getSize(): ?int
+    {
+        $size = 0;
+
+        foreach ($this->streams as $stream) {
+            $s = $stream->getSize();
+            if ($s === null) {
+                return null;
+            }
+            $size += $s;
+        }
+
+        return $size;
+    }
+
+    public function eof(): bool
+    {
+        return !$this->streams
+            || ($this->current >= count($this->streams) - 1
+             && $this->streams[$this->current]->eof());
+    }
+
+    public function rewind(): void
+    {
+        $this->seek(0);
+    }
+
+    /**
+     * Attempts to seek to the given position. Only supports SEEK_SET.
+     */
+    public function seek($offset, $whence = SEEK_SET): void
+    {
+        if (!$this->seekable) {
+            throw new \RuntimeException('This AppendStream is not seekable');
+        } elseif ($whence !== SEEK_SET) {
+            throw new \RuntimeException('The AppendStream can only seek with SEEK_SET');
+        }
+
+        $this->pos = $this->current = 0;
+
+        // Rewind each stream
+        foreach ($this->streams as $i => $stream) {
+            try {
+                $stream->rewind();
+            } catch (\Exception $e) {
+                throw new \RuntimeException('Unable to seek stream '
+                    .$i.' of the AppendStream', 0, $e);
+            }
+        }
+
+        // Seek to the actual position by reading from each stream
+        while ($this->pos < $offset && !$this->eof()) {
+            $result = $this->read(min(8096, $offset - $this->pos));
+            if ($result === '') {
+                break;
+            }
+        }
+    }
+
+    /**
+     * Reads from all of the appended streams until the length is met or EOF.
+     */
+    public function read($length): string
+    {
+        $buffer = '';
+        $total = count($this->streams) - 1;
+        $remaining = $length;
+        $progressToNext = false;
+
+        while ($remaining > 0) {
+            // Progress to the next stream if needed.
+            if ($progressToNext || $this->streams[$this->current]->eof()) {
+                $progressToNext = false;
+                if ($this->current === $total) {
+                    break;
+                }
+                ++$this->current;
+            }
+
+            $result = $this->streams[$this->current]->read($remaining);
+
+            if ($result === '') {
+                $progressToNext = true;
+                continue;
+            }
+
+            $buffer .= $result;
+            $remaining = $length - strlen($buffer);
+        }
+
+        $this->pos += strlen($buffer);
+
+        return $buffer;
+    }
+
+    public function isReadable(): bool
+    {
+        return true;
+    }
+
+    public function isWritable(): bool
+    {
+        return false;
+    }
+
+    public function isSeekable(): bool
+    {
+        return $this->seekable;
+    }
+
+    public function write($string): int
+    {
+        throw new \RuntimeException('Cannot write to an AppendStream');
+    }
+
+    /**
+     * @return mixed
+     */
+    public function getMetadata($key = null)
+    {
+        return $key ? null : [];
+    }
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     <?php
+
+declare(strict_types=1);
+
+namespace GuzzleHttp\Psr7;
+
+use Psr\Http\Message\StreamInterface;
+
+/**
+ * Provides a buffer stream that can be written to to fill a buffer, and read
+ * from to remove bytes from the buffer.
+ *
+ * This stream returns a "hwm" metadata value that tells upstream consumers
+ * what the configured high water mark of the stream is, or the maximum
+ * preferred size of the buffer.
+ */
+final class BufferStream implements StreamInterface
+{
+    /** @var int */
+    private $hwm;
+
+    /** @var string */
+    private $buffer = '';
+
+    /**
+     * @param int $hwm High water mark, representing the preferred maximum
+     *                 buffer size. If the size of the buffer exceeds the high
+     *                 water mark, then calls to write will continue to succeed
+     *                 but will return 0 to inform writers to slow down
+     *                 until the buffer has been drained by reading from it.
+     */
+    public function __construct(int $hwm = 16384)
+    {
+        $this->hwm = $hwm;
+    }
+
+    public function __toString(): string
+    {
+        return $this->getContents();
+    }
+
+    public function getContents(): string
+    {
+        $buffer = $this->buffer;
+        $this->buffer = '';
+
+        return $buffer;
+    }
+
+    public function close(): void
+    {
+        $this->buffer = '';
+    }
+
+    public function detach()
+    {
+        $this->close();
+
+        return null;
+    }
+
+    public function getSize(): ?int
+    {
+        return strlen($this->buffer);
+    }
+
+    public function isReadable(): bool
+    {
+        return true;
+    }
+
+    public function isWritable(): bool
+    {
+        return true;
+    }
+
+    public function isSeekable(): bool
+    {
+        return false;
+    }
+
+    public function rewind(): void
+    {
+        $this->seek(0);
+    }
+
+    public function seek($offset, $whence = SEEK_SET): void
+    {
+        throw new \RuntimeException('Cannot seek a BufferStream');
+    }
+
+    public function eof(): bool
+    {
+        return strlen($this->buffer) === 0;
+    }
+
+    public function tell(): int
+    {
+        throw new \RuntimeException('Cannot determine the position of a BufferStream');
+    }
+
+    /**
+     * Reads data from the buffer.
+     */
+    public function read($length): string
+    {
+        $currentLength = strlen($this->buffer);
+
+        if ($length >= $currentLength) {
+            // No need to slice the buffer because we don't have enough data.
+            $result = $this->buffer;
+            $this->buffer = '';
+        } else {
+            // Slice up the result to provide a subset of the buffer.
+            $result = substr($this->buffer, 0, $length);
+            $this->buffer = substr($this->buffer, $length);
+        }
+
+        return $result;
+    }
+
+    /**
+     * Writes data to the buffer.
+     */
+    public function write($string): int
+    {
+        $this->buffer .= $string;
+
+        if (strlen($this->buffer) >= $this->hwm) {
+            return 0;
+        }
+
+        return strlen($string);
+    }
+
+    /**
+     * @return mixed
+     */
+    public function getMetadata($key = null)
+    {
+        if ($key === 'hwm') {
+            return $this->hwm;
+        }
+
+        return $key ? null : [];
+    }
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                <?php
+
+declare(strict_types=1);
+
+namespace GuzzleHttp\Psr7;
+
+use Psr\Http\Message\StreamInterface;
+
+/**
+ * Stream decorator that can cache previously read bytes from a sequentially
+ * read stream.
+ */
+final class CachingStream implements StreamInterface
+{
+    use StreamDecoratorTrait;
+
+    /** @var StreamInterface Stream being wrapped */
+    private $remoteStream;
+
+    /** @var int Number of bytes to skip reading due to a write on the buffer */
+    private $skipReadBytes = 0;
+
+    /**
+     * @var StreamInterface
+     */
+    private $stream;
+
+    /**
+     * We will treat the buffer object as the body of the stream
+     *
+     * @param StreamInterface $stream Stream to cache. The cursor is assumed to be at the beginning of the stream.
+     * @param StreamInterface $target Optionally specify where data is cached
+     */
+    public function __construct(
+        StreamInterface $stream,
+        StreamInterface $target = null
+    ) {
+        $this->remoteStream = $stream;
+        $this->stream = $target ?: new Stream(Utils::tryFopen('php://temp', 'r+'));
+    }
+
+    public function getSize(): ?int
+    {
+        $remoteSize = $this->remoteStream->getSize();
+
+        if (null === $remoteSize) {
+            return null;
+        }
+
+        return max($this->stream->getSize(), $remoteSize);
+    }
+
+    public function rewind(): void
+    {
+        $this->seek(0);
+    }
+
+    public function seek($offset, $whence = SEEK_SET): void
+    {
+        if ($whence === SEEK_SET) {
+            $byte = $offset;
+        } elseif ($whence === SEEK_CUR) {
+            $byte = $offset + $this->tell();
+        } elseif ($whence === SEEK_END) {
+            $size = $this->remoteStream->getSize();
+            if ($size === null) {
+                $size = $this->cacheEntireStream();
+            }
+            $byte = $size + $offset;
+        } else {
+            throw new \InvalidArgumentException('Invalid whence');
+        }
+
+        $diff = $byte - $this->stream->getSize();
+
+        if ($diff > 0) {
+            // Read the remoteStream until we have read in at least the amount
+            // of bytes requested, or we reach the end of the file.
+            while ($diff > 0 && !$this->remoteStream->eof()) {
+                $this->read($diff);
+                $diff = $byte - $this->stream->getSize();
+            }
+        } else {
+            // We can just do a normal seek since we've already seen this byte.
+            $this->stream->seek($byte);
+        }
+    }
+
+    public function read($length): string
+    {
+        // Perform a regular read on any previously read data from the buffer
+        $data = $this->stream->read($length);
+        $remaining = $length - strlen($data);
+
+        // More data was requested so read from the remote stream
+        if ($remaining) {
+            // If data was written to the buffer in a position that would have
+            // been filled from the remote stream, then we must skip bytes on
+            // the remote stream to emulate overwriting bytes from that
+            // position. This mimics the behavior of other PHP stream wrappers.
+            $remoteData = $this->remoteStream->read(
+                $remaining + $this->skipReadBytes
+            );
+
+            if ($this->skipReadBytes) {
+                $len = strlen($remoteData);
+                $remoteData = substr($remoteData, $this->skipReadBytes);
+                $this->skipReadBytes = max(0, $this->skipReadBytes - $len);
+            }
+
+            $data .= $remoteData;
+            $this->stream->write($remoteData);
+        }
+
+        return $data;
+    }
+
+    public function write($string): int
+    {
+        // When appending to the end of the currently read stream, you'll want
+        // to skip bytes from being read from the remote stream to emulate
+        // other stream wrappers. Basically replacing bytes of data of a fixed
+        // length.
+        $overflow = (strlen($string) + $this->tell()) - $this->remoteStream->tell();
+        if ($overflow > 0) {
+            $this->skipReadBytes += $overflow;
+        }
+
+        return $this->stream->write($string);
+    }
+
+    public function eof(): bool
+    {
+        return $this->stream->eof() && $this->remoteStream->eof();
+    }
+
+    /**
+     * Close both the remote stream and buffer stream
+     */
+    public function close(): void
+    {
+        $this->remoteStream->close();
+        $this->stream->close();
+    }
+
+    private function cacheEntireStream(): int
+    {
+        $target = new FnStream(['write' => 'strlen']);
+        Utils::copyToStream($this, $target);
+
+        return $this->tell();
+    }
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                <?php
+
+declare(strict_types=1);
+
+namespace GuzzleHttp\Psr7;
+
+use Psr\Http\Message\StreamInterface;
+
+/**
+ * Stream decorator that begins dropping data once the size of the underlying
+ * stream becomes too full.
+ */
+final class DroppingStream implements StreamInterface
+{
+    use StreamDecoratorTrait;
+
+    /** @var int */
+    private $maxLength;
+
+    /** @var StreamInterface */
+    private $stream;
+
+    /**
+     * @param StreamInterface $stream    Underlying stream to decorate.
+     * @param int             $maxLength Maximum size before dropping data.
+     */
+    public function __construct(StreamInterface $stream, int $maxLength)
+    {
+        $this->stream = $stream;
+        $this->maxLength = $maxLength;
+    }
+
+    public function write($string): int
+    {
+        $diff = $this->maxLength - $this->stream->getSize();
+
+        // Begin returning 0 when the underlying stream is too large.
+        if ($diff <= 0) {
+            return 0;
+        }
+
+        // Write the stream or a subset of the stream if needed.
+        if (strlen($string) < $diff) {
+            return $this->stream->write($string);
+        }
+
+        return $this->stream->write(substr($string, 0, $diff));
+    }
+}
+                                                                                                                                            

@@ -1,0 +1,215 @@
+
+  /* Batik kanan */
+.pc-header::after {
+    content: "";
+    position: absolute;
+    z-index: -2;
+    inset: 0;
+    background: url('/image/bg-login.jpg') right center / 900px no-repeat;
+    opacity: 0.12;
+    overflow: hidden;
+    mask-image: linear-gradient(to right, transparent 0%, black 50%);
+    -webkit-mask-image: linear-gradient(to right, transparent 0%, black 50%);
+}
+
+/* Transparansi kiri */
+.pc-header::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    background: linear-gradient(
+        to right,
+        rgba(19,60,90,80),  /* lebih terang/transparan */
+        rgba(10,60,90,0) 100%
+    );
+}
+.profile-wrapper {
+    position: relative;
+    display: inline-block;
+}
+
+.profile-img {
+    width: 140px;
+    height: 140px;
+    border-radius: 50%;
+    object-fit: cover;
+    border: 4px solid #fff;
+    box-shadow: 0 8px 25px rgba(0,0,0,0.15);
+    transition: 0.3s ease;
+}
+.profile-img-avatar {
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    object-fit: cover;
+    border: 2px solid #fff;     /* WAJIB supaya tidak lonjong */
+    display: block;
+}
+
+/* Hover effect */
+.profile-wrapper:hover .profile-img {
+    transform: scale(1.05);
+}
+
+/* Tombol kamera */
+.camera-btn {
+    position: absolute;
+    bottom: 5px;
+    right: 5px;
+    background: linear-gradient(135deg, #2f5ea8, #1e3c72);
+    color: white;
+    width: 38px;
+    height: 38px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    box-shadow: 0 4px 10px rgba(0,0,0,0.3);
+    transition: 0.3s;
+}
+
+.camera-btn:hover {
+    transform: scale(1.1);
+}
+.document-wrapper {
+    display: inline-block;
+    text-align: center;
+}
+
+.document-img {
+    width: 220px;
+    height: 150px;
+    object-fit: cover;
+    border-radius: 10px;
+    box-shadow: 0 6px 20px rgba(0,0,0,0.15);
+    margin-bottom: 10px;
+    transition: 0.3s ease;
+}
+
+.document-img:hover {
+    transform: scale(1.03);
+}
+
+/* Tombol modern */
+.doc-btn {
+    display: inline-block;
+    padding: 6px 18px;
+    background: linear-gradient(135deg, #2f5ea8, #1e3c72);
+    color: white;
+    border-radius: 30px;
+    cursor: pointer;
+    font-size: 13px;
+    transition: 0.3s;
+}
+
+.doc-btn:hover {
+    transform: scale(1.05);
+}
+
+body{
+    background:#f4f6f9;
+}
+
+/* ===== CARD ===== */
+.card-custom{
+    border:none;
+    border-radius:16px;
+    box-shadow:0 6px 20px rgba(0,0,0,0.05);
+}
+
+/* ===== EMPTY STATE ===== */
+.empty-state{
+    text-align:center;
+    padding:80px 20px;
+    color:#999;
+}
+
+/* ===== PROFILE CARD ===== */
+.profile-card{
+    display:flex;
+    align-items:center;
+    gap:15px;
+}
+/* ===== CALENDAR ===== */
+.calendar-day{
+    width:35px;
+    height:35px;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    border-radius:8px;
+    cursor:pointer;
+}
+
+.calendar-day.active{
+    background:#0d6efd;
+    color:white;
+}
+
+/* ===== DONUT ===== */
+.progress-circle{
+    width:120px;
+    height:120px;
+    border-radius:50%;
+    background:conic-gradient(#0d6efd 70%, #e9ecef 0%);
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    font-weight:bold;
+    font-size:20px;
+}
+.calendar-popup{
+    position:absolute;
+    top:45px;
+    right:0;
+    width:300px;
+    border-radius:16px;
+    display:none;
+    z-index:1000;
+}
+
+.calendar-grid{
+    display:grid;
+    grid-template-columns: repeat(7,1fr);
+    gap:5px;
+}
+
+.calendar-day{
+    padding:8px;
+    text-align:center;
+    border-radius:8px;
+    cursor:pointer;
+    font-size:14px;
+}
+
+.calendar-day:hover{
+    background:#e9ecef;
+}
+
+.calendar-day.active{
+    background:#0d6efd;
+    color:white;
+}
+.bg-card {
+    position: relative;
+    background-image: url('/image/R.jpg');
+    background-size: cover;
+    background-position: center;
+    color: white;
+    border-radius: 20px;
+    overflow: hidden;
+    
+}
+
+.bg-card::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+}
+
+.bg-card .card-body {
+    position: relative;
+    z-index: 1;
+}
