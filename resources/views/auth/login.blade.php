@@ -23,7 +23,7 @@
     <main>
         <section class="login">
             <div class="bg-login"></div>
-            <div class="container login-container">
+            <div class="container login-container d-flex justify-content-center align-items-center vh-100">
                 <div class="card login-card" style="width: 18rem">
                     <div class="container">
                         <img src="\image\icon.png" class="logo-login" alt="">

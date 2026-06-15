@@ -9,9 +9,4 @@ class Status_kepegawaian extends Model
 {
     use HasFactory;
     protected $guarded = ['id'];
-
-    public function gurus()
-{
-    return $this->hasMany(Guru::class);
-}
 }
