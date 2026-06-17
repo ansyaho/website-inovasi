@@ -108,19 +108,6 @@
                         </a>
                     </li>
 
-                    <!-- ==================== Tambahan Menu Perpustakaan SLiMS ==================== -->
-                    <li class="pc-item pc-caption">
-                        <label>Layanan</label>
-                        <i class="ti ti-book"></i>
-                    </li>
-                    <li class="pc-item">
-                        <a href="https://perpus.alfatechdigital.my.id" class="pc-link" target="_blank">
-                            <span class="pc-micon"><i class="ti ti-book"></i></span>
-                            <span class="pc-mtext">Perpustakaan</span>
-                        </a>
-                    </li>
-                    <!-- ========================================================================== -->
-
                     <li class="pc-item pc-caption">
                         <label>Edit</label>
                         <i class="ti ti-brand-chrome"></i>
@@ -146,12 +133,14 @@
                                     <li class="pc-item"><a class="pc-link" href="/profilks">Profil Kepala Sekolah</a>
                                     </li>
                                 </ul>
-                             retreat     </li>
+                            </li>
                             <li class="pc-item pc-hasmenu">
                                 <a href="#!" class="pc-link">Keunggulan<span class="pc-arrow"><i
                                             data-feather="chevron-right"></i></span></a>
                                 <ul class="pc-submenu">
                                     <li class="pc-item"><a class="pc-link" href="#!">Sarana dan Prasarana</a>
+                                    </li>
+                                    <li class="pc-item"><a class="pc-link" href="#!">E-Perpus</a>
                                     </li>
                                     <li class="pc-item"><a class="pc-link" href="#!">Ekstrakurikuler</a></li>
 
@@ -189,7 +178,10 @@
                 </ul>
                 <div class="pc-navbar-card bg-primary rounded">
                     <img src="/image/LOGOWEB.png" alt="user-image" width="140"
-                        style="background-color: white; border-radius: 5px; padding: 5px; margin-bottom: 15px;" />
+                        style="background-color: white;
+    border-radius: 5px;
+    padding: 5px;
+    margin-bottom: 15px;" />
 
                 </div>
                 <div class="w-100 text-center">

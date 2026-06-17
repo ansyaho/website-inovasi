@@ -31,6 +31,7 @@
                     </a>
                     <ul class="dropdown-menu">
                         <li><a class="dropdown-item" href="#">Sarana dan Prasarana</a></li>
+                        <li><a class="dropdown-item" href="https://www.perpus.alfatechdigital.my.id/slims/index.php?p=login">E-Perpus</a></li>
                         <li><a class="dropdown-item" href="#">Ekstrakurikuler</a></li>
 
                     </ul>
